@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .errors import DomainError, ValidationError
+from .participation import ParticipationService
 from .service import DomainService
 from .storage import Database
 
@@ -21,6 +23,7 @@ def route(service: DomainService, method: str, path: str, body: dict[str, Any] |
     body = body or {}
     parsed = urlparse(path)
     actor_id = headers.get("X-Actor-Id", "")
+    participation = ParticipationService(service.database, service.clock)
     try:
         if method == "GET" and parsed.path == "/health":
             valid, count = service.verify_audit()
@@ -48,11 +51,97 @@ def route(service: DomainService, method: str, path: str, body: dict[str, Any] |
             query = parse_qs(parsed.query)
             after = int(query.get("after_sequence", ["0"])[0])
             return 200, {"items": service.audit_events(after)}
+
+        status, payload = _route_participation(participation, method, parsed, body, actor_id)
+        if status is not None:
+            return status, payload
         return 404, {"error": "route_not_found", "message": "接口不存在"}
     except DomainError as exc:
         return exc.status, {"error": exc.code, "message": str(exc)}
     except (TypeError, ValueError) as exc:
         return 400, {"error": "invalid_request", "message": str(exc)}
+
+
+def _route_participation(participation: ParticipationService, method: str, parsed,
+                         body: dict[str, Any], actor_id: str) -> tuple[int | None, dict[str, Any]]:
+    """分派社会资本准入退出相关路由。"""
+
+    path = parsed.path
+    query = parse_qs(parsed.query)
+    p = participation
+
+    def created(result: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        return (200 if result.get("replayed") else 201), result
+
+    if method == "POST":
+        if path == "/rule-versions":
+            return created(p.publish_rule_version(actor_id=actor_id, **body))
+        if path == "/investors":
+            return created(p.register_investor(actor_id=actor_id, **body))
+        if path == "/investor-relations":
+            return created(p.register_relation(actor_id=actor_id, **body))
+        if path == "/assets":
+            return created(p.register_asset(actor_id=actor_id, **body))
+        if path == "/evidence":
+            return created(p.register_evidence(actor_id=actor_id, **body))
+        if path == "/projects":
+            return created(p.create_project(actor_id=actor_id, **body))
+        if path == "/review-tasks":
+            return created(p.submit_review_task(actor_id=actor_id, **body))
+
+        match = re.fullmatch(r"/investor-relations/([^/]+)/revoke", path)
+        if match:
+            return created(p.revoke_relation(actor_id=actor_id,
+                                             relation_id=match.group(1), **body))
+        match = re.fullmatch(r"/evidence/([^/]+)/(verify|revoke)", path)
+        if match:
+            evidence_id, action = match.groups()
+            func = p.verify_evidence if action == "verify" else p.revoke_evidence
+            return created(func(actor_id=actor_id, evidence_id=evidence_id, **body))
+        match = re.fullmatch(r"/projects/([^/]+)/versions", path)
+        if match:
+            return created(p.publish_project_version(actor_id=actor_id,
+                                                     project_id=match.group(1), **body))
+        match = re.fullmatch(r"/projects/([^/]+)/applications", path)
+        if match:
+            return created(p.submit_application(actor_id=actor_id,
+                                                project_id=match.group(1), **body))
+        match = re.fullmatch(r"/projects/([^/]+)/compare-candidates", path)
+        if match:
+            return 200, p.compare_candidates(project_id=match.group(1), **body)
+        match = re.fullmatch(r"/applications/([^/]+)/guarantees", path)
+        if match:
+            return created(p.post_guarantee(actor_id=actor_id,
+                                            application_id=match.group(1), **body))
+        match = re.fullmatch(r"/review-tasks/([^/]+)/sign", path)
+        if match:
+            return created(p.sign_review_task(actor_id=actor_id,
+                                              task_id=match.group(1), **body))
+        match = re.fullmatch(r"/agreements/([^/]+)/obligations", path)
+        if match:
+            return created(p.register_obligation(actor_id=actor_id,
+                                                 agreement_id=match.group(1), **body))
+        match = re.fullmatch(r"/obligations/([^/]+)/fulfill", path)
+        if match:
+            return created(p.fulfill_obligation(actor_id=actor_id,
+                                                obligation_id=match.group(1), **body))
+
+    if method == "GET":
+        if path == "/review-tasks":
+            status_filter = query.get("status", ["pending"])[0]
+            return 200, {"items": p.list_review_queue(status_filter)}
+        match = re.fullmatch(r"/applications/([^/]+)", path)
+        if match:
+            return 200, p.get_application(match.group(1))
+        match = re.fullmatch(r"/agreements/([^/]+)", path)
+        if match:
+            return 200, p.get_agreement(match.group(1))
+        match = re.fullmatch(r"/projects/([^/]+)/snapshot", path)
+        if match:
+            at = query.get("at", [None])[0]
+            return 200, p.project_snapshot(match.group(1), at)
+    return None, {}
+
 
 
 class Handler(BaseHTTPRequestHandler):
